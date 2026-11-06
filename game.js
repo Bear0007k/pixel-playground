@@ -7,7 +7,9 @@ const THEME = {
 // RULES: Speeds are in Canvas pixels per second.
 const RULES = {
   playerSpeed: 270, hazardSpeed: 115, speedPerLevel: 22,
-  maxHazardSpeed: 235, pointsPerLevel: 5, maxHazards: 8
+  maxHazardSpeed: 235, pointsPerLevel: 5, maxHazards: 8,
+  bulletSpeed: 520, fireRate: 0.22, hazardRespawnDelay: 1.5,
+  portalLevel: 3, portalPlayerSpeed: 150
 };
 
 const canvas = document.querySelector("#arena");
@@ -27,9 +29,13 @@ const touches = new Map();
 const storageKey = "pixel-playground-best";
 
 let state = "ready";
-let player, collectible, hazards, score, level;
+let player, collectible, hazards, bullets, hazardRespawns, score, level;
 let best = 0;
 let lastTime;
+let aim = { x: width, y: height / 2 };
+let firing = false;
+let fireCooldown = 0;
+let portalMode = false;
 
 try {
   best = Number(localStorage.getItem(storageKey)) || 0;
@@ -40,6 +46,11 @@ try {
 function resetRound() {
   player = { x: width / 2, y: height / 2, size: 26 };
   hazards = [];
+  bullets = [];
+  hazardRespawns = [];
+  portalMode = false;
+  firing = false;
+  fireCooldown = 0;
   collectible = undefined;
   score = 0;
   level = 1;
@@ -115,10 +126,20 @@ function movePlayer(dt) {
   const dx = Number(held("arrowright") || held("d")) - Number(held("arrowleft") || held("a"));
   const dy = Number(held("arrowdown") || held("s")) - Number(held("arrowup") || held("w"));
   // Normalize so moving diagonally is just as fast.
-  const distance = RULES.playerSpeed * dt / (Math.hypot(dx, dy) || 1);
+  const speed = portalMode ? RULES.portalPlayerSpeed : RULES.playerSpeed;
+  const distance = speed * dt / (Math.hypot(dx, dy) || 1);
   const edge = player.size / 2;
   player.x = clamp(player.x + dx * distance, edge, width - edge);
   player.y = clamp(player.y + dy * distance, edge, height - edge);
+}
+
+function updatePortal() {
+  if (level < RULES.portalLevel) return;
+  const gate = { x: portalMode ? 34 : width - 34, y: height / 2, size: 42 };
+  if (!overlaps(player, gate)) return;
+  portalMode = !portalMode;
+  player.x = portalMode ? 80 : width - 80;
+  player.y = height / 2;
 }
 
 function moveHazards(dt) {
@@ -134,9 +155,56 @@ function moveHazards(dt) {
   }
 }
 
+function aimFromPointer(event) {
+  const rect = canvas.getBoundingClientRect();
+  aim = {
+    x: (event.clientX - rect.left) * width / rect.width,
+    y: (event.clientY - rect.top) * height / rect.height
+  };
+}
+
+function fire(dt) {
+  fireCooldown = Math.max(0, fireCooldown - dt);
+  if (!firing || fireCooldown > 0) return;
+  const angle = Math.atan2(aim.y - player.y, aim.x - player.x);
+  const dx = Math.cos(angle);
+  const dy = Math.sin(angle);
+  bullets.push({ x: player.x + dx * 20, y: player.y + dy * 20, dx, dy, size: 8, life: 1.2 });
+  fireCooldown = RULES.fireRate;
+}
+
+function moveBullets(dt) {
+  for (const bullet of bullets) {
+    bullet.x += bullet.dx * RULES.bulletSpeed * dt;
+    bullet.y += bullet.dy * RULES.bulletSpeed * dt;
+    bullet.life -= dt;
+  }
+  bullets = bullets.filter(bullet => bullet.life > 0 && bullet.x >= 0 && bullet.x <= width && bullet.y >= 0 && bullet.y <= height);
+  for (const bullet of bullets) {
+    const hitIndex = hazards.findIndex(hazard => overlaps(bullet, hazard));
+    if (hitIndex !== -1) {
+      hazards.splice(hitIndex, 1);
+      hazardRespawns.push(RULES.hazardRespawnDelay);
+      bullet.life = 0;
+    }
+  }
+  bullets = bullets.filter(bullet => bullet.life > 0);
+}
+
+function updateHazardRespawns(dt) {
+  hazardRespawns = hazardRespawns.map(timeLeft => timeLeft - dt);
+  const due = hazardRespawns.filter(timeLeft => timeLeft <= 0).length;
+  hazardRespawns = hazardRespawns.filter(timeLeft => timeLeft > 0);
+  for (let i = 0; i < due; i++) addHazard();
+}
+
 function update(dt) {
   movePlayer(dt);
   moveHazards(dt);
+  updatePortal();
+  fire(dt);
+  moveBullets(dt);
+  updateHazardRespawns(dt);
   if (hazards.some(hazard => overlaps(player, hazard))) {
     endRound();
     return;
@@ -167,11 +235,31 @@ function drawSquare(object, color) {
 }
 
 function draw() {
-  ctx.fillStyle = THEME.background;
+  ctx.fillStyle = portalMode ? "#17132a" : THEME.background;
   ctx.fillRect(0, 0, width, height);
-  ctx.fillStyle = THEME.grid;
-  for (let x = 0; x < width; x += 24) ctx.fillRect(x, 0, 1, height);
-  for (let y = 0; y < height; y += 24) ctx.fillRect(0, y, width, 1);
+  if (portalMode) {
+    ctx.fillStyle = "#302644";
+    for (let y = 0; y < height; y += 40) {
+      for (let x = 0; x < width; x += 40) {
+        if ((Math.floor(x / 40) + Math.floor(y / 40)) % 2 === 0) ctx.fillRect(x + 3, y + 3, 34, 34);
+      }
+    }
+  } else {
+    ctx.fillStyle = THEME.grid;
+    for (let x = 0; x < width; x += 24) ctx.fillRect(x, 0, 1, height);
+    for (let y = 0; y < height; y += 24) ctx.fillRect(0, y, width, 1);
+  }
+  if (level >= RULES.portalLevel) {
+    const gateX = portalMode ? 34 : width - 34;
+    ctx.beginPath();
+    ctx.ellipse(gateX, height / 2, 16, 34, 0, 0, Math.PI * 2);
+    ctx.fillStyle = portalMode ? "#9b77ff" : "#69eddf";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(gateX, height / 2, 8, 25, 0, 0, Math.PI * 2);
+    ctx.fillStyle = "#11172a";
+    ctx.fill();
+  }
 
   if (collectible) {
     ctx.save();
@@ -188,6 +276,14 @@ function draw() {
     ctx.textBaseline = "middle";
     ctx.fillText("×", hazard.x, hazard.y + 1);
   }
+  for (const bullet of bullets) drawSquare(bullet, THEME.collectible);
+  const angle = Math.atan2(aim.y - player.y, aim.x - player.x);
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  ctx.rotate(angle);
+  ctx.fillStyle = "#d9e6f7";
+  ctx.fillRect(4, -4, 20, 8);
+  ctx.restore();
   drawSquare(player, THEME.player);
   ctx.fillStyle = THEME.background;
   ctx.fillRect(player.x - 7, player.y - 4, 4, 5);
@@ -206,9 +302,17 @@ function frame(time) {
 function clearInput() {
   keys.clear();
   touches.clear();
+  firing = false;
 }
 
 action.addEventListener("click", startRound);
+canvas.addEventListener("pointermove", aimFromPointer);
+canvas.addEventListener("pointerdown", event => {
+  if (event.pointerType !== "mouse" || event.button !== 0 || state !== "playing") return;
+  aimFromPointer(event);
+  firing = true;
+});
+window.addEventListener("pointerup", event => { if (event.pointerType === "mouse") firing = false; });
 window.addEventListener("keydown", event => {
   const key = event.key.toLowerCase();
   if (state !== "playing" || !controls.includes(key) ||
